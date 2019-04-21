@@ -1,0 +1,87 @@
+#!/bin/bash
+
+function Merge_Best {
+	Size_1=$(du -b "$1" | awk '{print $1}')
+	Size_2=$(du -b "$2" | awk '{print $1}')
+	if [ $Size_1 -gt $Size_2 ]; then
+		mv "$2" "$1"
+	else
+		rm "$2"
+	fi
+}
+
+function Try_JPEGTran {
+	Temp2="$(mktemp)"
+	jpegtran $2 -outfile "$Temp2" "$1"
+	Temp3="$(mktemp)"
+	"$Root/jfifremove" < "$Temp2" > "$Temp3"
+	rm "$Temp2"
+	Merge_Best "$1" "$Temp3"
+}
+
+# Bail out in case of error
+function kill_children_and_exit {
+	jobs | xargs kill -9
+	exit 1
+}
+trap kill_children_and_exit ERR
+
+# Where the script is located
+Root="$(cd "$(dirname "$0")" && pwd)"
+
+# Process each image serially
+for Image; do
+	MIME="$(file -b --mime-type -- "$Image")"
+
+	# Have the current-best version live in the same dir as the original image to avoid atomicity issues
+	Temp="$(mktemp --tmpdir="$(dirname "$Image")")"
+	Temp2="$(mktemp)"
+	trap "rm -f '$Temp' '$Temp.png' '$Temp2'" EXIT
+
+	case $MIME in
+	image/jpeg)
+		jpegrescan -q -i "$Image" "$Temp" 2> /dev/null
+		"$Root/jfifremove" < "$Temp" > "$Temp2"
+		mv "$Temp2" "$Temp"
+
+		Try_JPEGTran "$Temp" '-optimize'
+		Try_JPEGTran "$Temp" '-optimize -progressive' ;;
+		#Try_JPEGTran "$Temp" '-arithmetic'
+		#Try_JPEGTran "$Temp" '-arithmetic -progressive' ;;
+	image/png)
+		cp "$Image" "$Temp.png"
+		WINEDEBUG=-all,+warn,+err wine "$Root/TruePNG.0625.exe" /quiet /force /o max "$Temp.png" > /dev/null
+                mv "$Temp.png" "$Temp"
+		zopflipng -m -y --always_zopflify "$Temp" "$Temp2" &> /dev/null
+		Merge_Best "$Temp" "$Temp2"
+		"$Root/defluff-0-3-2" < "$Temp" > "$Temp2" 2> /dev/null
+		Merge_Best "$Temp" "$Temp2" ;;
+	image/webp)
+		cwebp -quiet -q 100 -sns 100 -m 6 -mt -af -alpha_filter best -alpha_cleanup -lossless "$Image" -o "$Temp" ;;
+	image/gif)
+		gifsicle -O3 "$Image" -o "$Temp" ;;
+	* )
+		echo "$Image:" unknown file format: $MIME >&2
+		exit 1 ;;
+	esac
+
+	Old_Size=$(du -b -- "$Image" | awk '{print $1}')
+	New_Size=$(du -b -- "$Temp" | awk '{print $1}')
+
+	if [ $New_Size -eq 0 ]; then
+		echo "$Image:" some command produced an empty file >&2
+		exit 1
+	fi
+
+	if [ $New_Size -lt $Old_Size ]; then
+		mv "$Temp" "$Image"
+		Message="reduced $(($Old_Size - $New_Size)) bytes ($(bc <<< "scale=2;100-$New_Size*100/$Old_Size")%)"
+	else
+		rm "$Temp"
+		Message=unchanged
+	fi
+
+	echo "$Image:" $Message
+
+	rm -f "$Temp2"
+done
